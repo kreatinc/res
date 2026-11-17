@@ -2,11 +2,19 @@
 (function () {
   const ATTRIBUTION_COOKIE = 'nl_first_paid';
   const COOKIE_DOMAIN = '.nuelink.com';
+  const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
+  const FIRST_PAID_KEYS = ['first_paid_source', 'first_paid_medium', 'first_paid_campaign', 'first_paid_content', 'first_paid_term'];
+  const CLICK_ID_KEYS = ['fbclid', 'gclid', 'gbraid', 'wbraid', 'msclkid', 'ttclid', 'li_fat_id', 'twclid', 'epik', 'sccid'];
 
   // Helper: Read a cookie by name
   function getCookie(name) {
     const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-    return match ? decodeURIComponent(match[2]) : null;
+    if (!match) return null;
+    try {
+      return decodeURIComponent(match[2]);
+    } catch (e) {
+      return null;
+    }
   }
 
   // Helper: Parse all expected URL parameters into an object
@@ -18,6 +26,8 @@
       'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
       // Ad Network Click IDs
       'fbclid', 'gclid', 'gbraid', 'wbraid', 'msclkid', 'ttclid', 'li_fat_id', 'twclid', 'epik', 'sccid',
+      // Time of the forwarded Facebook click (added by offers and public pages)
+      'fbclid_timestamp_ms',
       // Explicit First Paid Layer (Passed from offer site)
       'first_paid_source', 'first_paid_medium', 'first_paid_campaign', 'first_paid_content', 'first_paid_term',
       'first_paid_landing_page',
@@ -35,36 +45,107 @@
     return data;
   }
 
-  function getOrMintFbc(fbclid, urlFbc, timestampMs) {
-    if (urlFbc) return urlFbc;
-    const nativePixelFbc = getCookie('_fbc');
-    if (nativePixelFbc) return nativePixelFbc;
+  // Website and offer-page buttons tag their signup links with their own labels.
+  // Those labels are not acquisition: they must not create, block or fill a
+  // first-paid record.
+  function isInternal(source, medium) {
+    return source === 'nuelink' ||
+      (source === 'offer.nuelink.com' && medium === 'landing-page') ||
+      (!source && medium === 'landing-page');
+  }
 
-    if (fbclid) {
-      const ts = timestampMs || Date.now();
-      return `fb.1.${ts}.${fbclid}`;
+  function hasClickId(data) {
+    return CLICK_ID_KEYS.some((key) => Boolean(data && data[key]));
+  }
+
+  // URL parameters with internal labels removed. Click IDs are always kept.
+  function acquisitionParams(params) {
+    const clean = Object.assign({}, params);
+    if (clean.utm_source === 'offer.nuelink.com') delete clean.utm_source;
+    if (isInternal(params.utm_source, params.utm_medium)) {
+      UTM_KEYS.forEach((key) => delete clean[key]);
+    }
+    if (isInternal(clean.first_paid_source, clean.first_paid_medium)) {
+      FIRST_PAID_KEYS.forEach((key) => delete clean[key]);
+    }
+    return clean;
+  }
+
+  // The stored first touch, or null when there is none worth keeping. A record
+  // made only of internal labels, or one that cannot be read, counts as absent
+  // so a later genuine campaign can replace it. A record with internal labels
+  // and a real click ID keeps the click and loses the labels.
+  function readFirstTouch() {
+    const raw = getCookie(ATTRIBUTION_COOKIE);
+    if (!raw) return null;
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      console.error('Failed to parse nl_first_paid cookie', e);
+      return null;
+    }
+    if (!data || typeof data !== 'object') return null;
+    if (isInternal(data.first_paid_source, data.first_paid_medium)) {
+      if (!hasClickId(data)) return null;
+      data = Object.assign({}, data);
+      FIRST_PAID_KEYS.forEach((key) => { data[key] = null; });
+    }
+    return data;
+  }
+
+  // A positive whole-number time in ms that is not in the future, or null.
+  function validTime(value) {
+    if (!/^\d+$/.test(String(value === undefined || value === null ? '' : value))) return null;
+    const n = Number(value);
+    return Number.isSafeInteger(n) && n > 0 && n <= Date.now() ? n : null;
+  }
+
+  // fb.<n>.<time>.<click ID>, or null when malformed.
+  function parseFbc(value) {
+    const match = /^fb\.\d+\.(\d+)\.(.+)$/.exec(value || '');
+    const time = match && validTime(match[1]);
+    return time ? { id: match[2], time: time, value: value } : null;
+  }
+
+  // fbclid, fbc and fbclid_timestamp_ms always describe the same click.
+  function selectMetaClick(urlParams, firstTouchData) {
+    const candidates = [urlParams._fbc, getCookie('_fbc')].map(parseFbc).filter(Boolean);
+    const urlFbclid = urlParams.fbclid;
+
+    // The URL names the click: use an _fbc only if it is for that click.
+    if (urlFbclid) {
+      const match = candidates.find((entry) => entry.id === urlFbclid);
+      if (match) return { fbclid: urlFbclid, fbc: match.value, time: match.time };
+      const time = validTime(urlParams.fbclid_timestamp_ms) ||
+        (firstTouchData.fbclid === urlFbclid ? validTime(firstTouchData.first_seen_ms) : null) ||
+        Date.now();
+      return { fbclid: urlFbclid, fbc: `fb.1.${time}.${urlFbclid}`, time: time };
     }
 
-    return null;
+    // No click on the URL: an existing _fbc (usually the Meta pixel's record of
+    // the latest click) decides, and the ID and time are read from it.
+    if (candidates.length) {
+      return { fbclid: candidates[0].id, fbc: candidates[0].value, time: candidates[0].time };
+    }
+
+    // Otherwise the first-touch click, as before.
+    const firstTime = validTime(firstTouchData.first_seen_ms) || Date.now();
+    if (firstTouchData.fbclid) {
+      return { fbclid: firstTouchData.fbclid, fbc: `fb.1.${firstTime}.${firstTouchData.fbclid}`, time: firstTime };
+    }
+    return { fbclid: null, fbc: null, time: firstTime };
   }
 
   function initAttributionCapture() {
-    const params = getUrlParams();
-
-    if (params.utm_source === 'offer.nuelink.com') {
-      delete params.utm_source;
-    }
+    const params = acquisitionParams(getUrlParams());
 
     const hasPaidParam = Boolean(
-      params.fbclid || params.gclid || params.gbraid || params.wbraid ||
-      params.msclkid || params.ttclid || params.li_fat_id || params.twclid ||
-      params.epik || params.sccid || params.utm_source || params.utm_campaign ||
+      hasClickId(params) || params.utm_source || params.utm_campaign ||
       params.first_paid_source
     );
 
-    const existingCookie = getCookie(ATTRIBUTION_COOKIE);
-
-    if (!existingCookie && hasPaidParam) {
+    if (!readFirstTouch() && hasPaidParam) {
       const nowMs = Date.now();
       const cookiePayload = {
         first_paid_source: params.first_paid_source || params.utm_source || null,
@@ -76,7 +157,6 @@
 
         offer_landing_host: params.offer_landing_host || window.location.hostname,
         offer_name: params.offer_name || null,
-    
 
         fbclid: params.fbclid || null,
         gclid: params.gclid || null,
@@ -88,15 +168,13 @@
         twclid: params.twclid || null,
         epik: params.epik || null,
         sccid: params.sccid || null,
-   
 
-        first_seen: new Date().toISOString(),
+        first_seen: new Date(nowMs).toISOString(),
         first_seen_ms: nowMs,
         referrer: document.referrer || ''
       };
 
       const cookieValue = encodeURIComponent(JSON.stringify(cookiePayload));
-
 
       document.cookie = `${ATTRIBUTION_COOKIE}=${cookieValue}; Domain=${COOKIE_DOMAIN}; Path=/; Max-Age=7776000; SameSite=Lax; Secure`;
     }
@@ -105,35 +183,24 @@
   // 2. Build the complete payload for backend consumption at signup
   function getSignupAttributionPayload() {
     const urlParams = getUrlParams();
-    let firstTouchData = {};
-
-    // Read fallback cookie from root domain
-    const cookieRaw = getCookie(ATTRIBUTION_COOKIE);
-    if (cookieRaw) {
-      try {
-        firstTouchData = JSON.parse(cookieRaw);
-      } catch (e) {
-        console.error('Failed to parse nl_first_paid cookie', e);
-      }
-    }
-
-    const fbclid = urlParams.fbclid || firstTouchData.fbclid || null;
-    const fbclidTimestampMs = firstTouchData.first_seen_ms || Date.now();
+    const clean = acquisitionParams(urlParams);
+    const firstTouchData = readFirstTouch() || {};
+    const meta = selectMetaClick(urlParams, firstTouchData);
 
     return {
-      // --- LIVE / CURRENT TOUCH LAYER ---
+      // --- LIVE / CURRENT TOUCH LAYER (unchanged: reports read these as sent) ---
       utm_source: urlParams.utm_source || null,
       utm_medium: urlParams.utm_medium || null,
       utm_campaign: urlParams.utm_campaign || null,
       utm_content: urlParams.utm_content || null,
       utm_term: urlParams.utm_term || null,
 
-      // --- ORIGINAL ACQUISITION (FIRST PAID) LAYER ---
-      first_paid_source: urlParams.first_paid_source || firstTouchData.first_paid_source || urlParams.utm_source || null,
-      first_paid_medium: urlParams.first_paid_medium || firstTouchData.first_paid_medium || urlParams.utm_medium || null,
-      first_paid_campaign: urlParams.first_paid_campaign || firstTouchData.first_paid_campaign || urlParams.utm_campaign || null,
-      first_paid_content: urlParams.first_paid_content || firstTouchData.first_paid_content || urlParams.utm_content || null,
-      first_paid_term: urlParams.first_paid_term || firstTouchData.first_paid_term || urlParams.utm_term || null,
+      // --- ORIGINAL ACQUISITION (FIRST PAID) LAYER, without internal labels ---
+      first_paid_source: clean.first_paid_source || firstTouchData.first_paid_source || clean.utm_source || null,
+      first_paid_medium: clean.first_paid_medium || firstTouchData.first_paid_medium || clean.utm_medium || null,
+      first_paid_campaign: clean.first_paid_campaign || firstTouchData.first_paid_campaign || clean.utm_campaign || null,
+      first_paid_content: clean.first_paid_content || firstTouchData.first_paid_content || clean.utm_content || null,
+      first_paid_term: clean.first_paid_term || firstTouchData.first_paid_term || clean.utm_term || null,
       first_paid_landing_page: urlParams.first_paid_landing_page || firstTouchData.first_paid_landing_page || null,
 
       // --- OFFER CONTEXT ---
@@ -142,7 +209,7 @@
       offer_variant: urlParams.offer_variant || null,
 
       // --- CLICK IDENTIFIERS (ALL NETWORKS) ---
-      fbclid: fbclid,
+      fbclid: meta.fbclid,
       gclid: urlParams.gclid || firstTouchData.gclid || null,
       gbraid: urlParams.gbraid || firstTouchData.gbraid || null,
       wbraid: urlParams.wbraid || firstTouchData.wbraid || null,
@@ -154,9 +221,9 @@
       sccid: urlParams.sccid || firstTouchData.sccid || null,
 
       // --- META CAPI & TRACKING DEDUPLICATION ---
-      fbc: getOrMintFbc(fbclid, urlParams._fbc || getCookie('_fbc'), fbclidTimestampMs),
+      fbc: meta.fbc,
       fbp: urlParams._fbp || getCookie('_fbp') || null,
-      fbclid_timestamp_ms: fbclidTimestampMs,
+      fbclid_timestamp_ms: meta.time,
 
       // --- USER METADATA ---
       signup_url: window.location.href,
